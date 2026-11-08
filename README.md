@@ -2,6 +2,8 @@
 
 Your Mac keyboard types on Windows as soon as you move the Windows mouse. Touch the Mac trackpad and the keyboard is back on the Mac. Each computer keeps its own cursor.
 
+Laptop running Windows instead? The [`windows-keyboard`](../../tree/windows-keyboard) branch works the other way round: the Windows keyboard types on the Mac.
+
 ## How it works
 
 - **Mac** (`mac/`): a menu bar app (Swift). It captures the keyboard with an event tap and sends it over TCP (port 24850) while Windows is active. Menu bar icon: `⌨ MAC`, `⌨ WIN`, `⌨ -` (no Windows agent connected), `⌨ !` (Accessibility permission missing).
