@@ -21,6 +21,6 @@
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Połączenie z komputerem z Windowsem w sieci domowej, żeby pisać na nim klawiaturą Maca.</string>
+	<string>Połączenie z laptopem z Windowsem w sieci domowej, żeby jego klawiatura pisała na Macu.</string>
 </dict>
 </plist>

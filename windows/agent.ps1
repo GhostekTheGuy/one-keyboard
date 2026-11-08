@@ -1,6 +1,7 @@
-# Jedna Klawiatura - strona Windowsa (agent).
-# Łączy się z Makiem (port 24850), wpisuje to, co pisze klawiatura Maca,
-# i zgłasza Macowi ruch fizycznej myszy Windowsa (wtedy klawiatura Maca przechodzi tutaj).
+# Jedna Klawiatura (gałąź windows-keyboard) - strona Windowsa (agent).
+# Klawiatura tego laptopa pisze na Macu, kiedy ostatnio ruszono myszą Maca (Mac zgłasza "M").
+# Ruch fizycznej myszy/gładzika Windowsa oddaje klawiaturę Windowsowi.
+# Łączy się z Makiem (port 24850), przechwytuje klawisze hookiem WH_KEYBOARD_LL i wysyła je na Maca.
 param(
     [string[]]$Hosts = @(),
     [int]$Port = 24850
@@ -12,6 +13,7 @@ $log = Join-Path $dir 'agent.log'
 
 $code = @'
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Net.Sockets;
@@ -21,36 +23,44 @@ using System.Threading;
 
 namespace JK {
 public static class Agent {
-    [StructLayout(LayoutKind.Sequential)] struct MOUSEINPUT { public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
-    [StructLayout(LayoutKind.Sequential)] struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
-    [StructLayout(LayoutKind.Explicit)] struct UNION { [FieldOffset(0)] public MOUSEINPUT mi; [FieldOffset(0)] public KEYBDINPUT ki; }
-    [StructLayout(LayoutKind.Sequential)] struct INPUT { public uint type; public UNION u; }
     [StructLayout(LayoutKind.Sequential)] struct POINT { public int x; public int y; }
     [StructLayout(LayoutKind.Sequential)] struct MSLLHOOKSTRUCT { public POINT pt; public uint mouseData; public uint flags; public uint time; public IntPtr extra; }
+    [StructLayout(LayoutKind.Sequential)] struct KBDLLHOOKSTRUCT { public uint vkCode; public uint scanCode; public uint flags; public uint time; public IntPtr extra; }
     [StructLayout(LayoutKind.Sequential)] struct MSG { public IntPtr hwnd; public uint message; public IntPtr wParam; public IntPtr lParam; public uint time; public POINT pt; }
     delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
 
-    [DllImport("user32.dll", SetLastError = true)] static extern uint SendInput(uint n, INPUT[] inputs, int size);
-    [DllImport("user32.dll")] static extern uint MapVirtualKey(uint code, uint mapType);
     [DllImport("user32.dll", SetLastError = true)] static extern IntPtr SetWindowsHookEx(int id, HookProc fn, IntPtr hMod, uint tid);
     [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr h, int n, IntPtr w, IntPtr l);
     [DllImport("user32.dll")] static extern int GetMessage(out MSG m, IntPtr hwnd, uint a, uint b);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern IntPtr GetModuleHandle(string name);
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, IntPtr pid);
+    [DllImport("user32.dll")] static extern IntPtr GetKeyboardLayout(uint tid);
+    [DllImport("user32.dll")] static extern short GetKeyState(int vk);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern int ToUnicodeEx(uint vk, uint scan, byte[] state, StringBuilder buf, int size, uint flags, IntPtr hkl);
 
-    const uint KEYUP = 2, EXT = 1, UNI = 4;
-    static readonly int[] modVk = { 0xA0, 0xA2, 0xA4 }; // bity 1 shift, 2 ctrl, 4 alt
+    const uint LLKHF_EXTENDED = 0x01, LLKHF_INJECTED = 0x10, LLKHF_UP = 0x80;
 
-    static HookProc hookRef;
+    static HookProc keyRef, mouseRef;
     static Mutex single;
+    static string logPath;
+    /// klawiatura idzie na Maca (Mac zgłosił ruch swojej myszy)
+    static volatile bool onMac;
+    static volatile bool connected;
     static volatile bool mouseFlag;
     static int lastX, lastY;
     static double acc;
-    static long lastMoveMs, lastSignalMs;
+    static long lastMoveMs;
     static readonly object sendLock = new object();
     static NetworkStream stream;
-    static string logPath;
-    static int heldMods;
-    static HashSet<int> downVk = new HashSet<int>();
+    static readonly BlockingCollection<string> outbox = new BlockingCollection<string>();
+
+    // stan klawiszy, tylko w wątku hooka
+    static bool lShift, rShift, lCtrl, rCtrl, lAlt, rAlt, lWin, rWin;
+    /// klawisze wciśnięte, gdy klawiatura była na Macu: vk -> co wysłać przy puszczeniu ("" = nic, tylko połknąć)
+    static readonly Dictionary<uint, string> upMsgs = new Dictionary<uint, string>();
+    static char deadChar;
 
     static long Ms() { return DateTime.UtcNow.Ticks / 10000; }
 
@@ -64,10 +74,11 @@ public static class Agent {
         bool created;
         single = new Mutex(true, "Local\\JednaKlawiaturaAgent", out created);
         if (!created) { Log("agent juz dziala - koncze"); return; }
-        Log("start, hosty: " + string.Join(", ", hosts));
+        Log("start (klawiatura Windowsa na Maca), hosty: " + string.Join(", ", hosts));
 
         Thread ht = new Thread(HookThread); ht.IsBackground = true; ht.Start();
         Thread st = new Thread(SignalThread); st.IsBackground = true; st.Start();
+        Thread wt = new Thread(SendThread); wt.IsBackground = true; wt.Start();
 
         string lastErr = "";
         while (true) {
@@ -86,9 +97,11 @@ public static class Agent {
                     string msg = h + ": " + e.Message;
                     if (msg != lastErr) { Log("brak polaczenia " + msg); lastErr = msg; }
                 } finally {
+                    // bez Maca klawiatura zawsze wraca na Windowsa
+                    onMac = false;
+                    connected = false;
                     lock (sendLock) { stream = null; }
                     if (c != null) c.Close();
-                    ReleaseAll();
                 }
             }
             Thread.Sleep(2000);
@@ -99,7 +112,9 @@ public static class Agent {
         NetworkStream ns = c.GetStream();
         ns.ReadTimeout = 7000;
         lock (sendLock) { stream = ns; }
+        connected = true;
         Send("H " + Environment.MachineName);
+        Send("F 0");
         StringBuilder sb = new StringBuilder();
         byte[] buf = new byte[4096];
         while (true) {
@@ -113,111 +128,177 @@ public static class Agent {
             while ((idx = all.IndexOf('\n')) >= 0) {
                 string line = all.Substring(0, idx).Trim();
                 all = all.Substring(idx + 1);
-                if (line.Length > 0) {
-                    try { Handle(line); } catch (Exception e) { Log("blad '" + line + "': " + e.Message); }
-                }
+                if (line == "M") ToMac();
+                else if (line == "X") ToWindows();
             }
             sb.Length = 0;
             sb.Append(all);
         }
     }
 
-    static void Send(string s) {
-        lock (sendLock) {
-            if (stream == null) return;
-            try { byte[] b = Encoding.ASCII.GetBytes(s + "\n"); stream.Write(b, 0, b.Length); } catch { }
-        }
+    static void ToMac() {
+        if (!connected || onMac) return;
+        onMac = true;
+        Send("F 1");
     }
 
-    static void Handle(string line) {
-        string[] p = line.Split(' ');
-        switch (p[0]) {
-            case "U": {
-                List<ushort> units = new List<ushort>();
-                for (int i = 1; i < p.Length; i++) units.Add(Convert.ToUInt16(p[i], 16));
-                Unicode(units);
-                break;
+    static void ToWindows() {
+        if (!onMac) return;
+        onMac = false;
+        Send("R");
+        Send("F 0");
+    }
+
+    /// Kolejka zamiast pisania do sieci w hooku: hook musi wrócić w kilka ms, inaczej Windows go odłączy.
+    static void Send(string s) { outbox.Add(s); }
+
+    static void SendThread() {
+        foreach (string s in outbox.GetConsumingEnumerable()) {
+            lock (sendLock) {
+                if (stream == null) continue;
+                try { byte[] b = Encoding.ASCII.GetBytes(s + "\n"); stream.Write(b, 0, b.Length); } catch { }
             }
-            case "K":
-                Key(int.Parse(p[1]), p[2] == "1", int.Parse(p[3]), p[4] == "1");
-                break;
-            case "R":
-                ReleaseAll();
-                break;
         }
     }
 
-    static INPUT KI(ushort vk, ushort scan, uint flags) {
-        INPUT i = new INPUT();
-        i.type = 1;
-        i.u.ki.wVk = vk;
-        i.u.ki.wScan = scan;
-        i.u.ki.dwFlags = flags;
-        return i;
+    // ---------- klawiatura ----------
+
+    static bool IsModifier(uint vk) {
+        return (vk >= 0xA0 && vk <= 0xA5) || vk == 0x5B || vk == 0x5C || vk == 0x10 || vk == 0x11 || vk == 0x12;
     }
 
-    static INPUT VkInput(int vk, bool down, bool ext) {
-        ushort scan = (ushort)MapVirtualKey((uint)vk, 0);
-        uint f = (down ? 0 : KEYUP) | (ext ? EXT : 0);
-        return KI((ushort)vk, scan, f);
-    }
-
-    static void Inject(List<INPUT> l) {
-        if (l.Count == 0) return;
-        SendInput((uint)l.Count, l.ToArray(), Marshal.SizeOf(typeof(INPUT)));
-    }
-
-    static void SetMods(List<INPUT> l, int want) {
-        for (int b = 0; b < 3; b++) {
-            int bit = 1 << b;
-            bool has = (heldMods & bit) != 0, w = (want & bit) != 0;
-            if (has && !w) l.Add(VkInput(modVk[b], false, false));
-            if (!has && w) l.Add(VkInput(modVk[b], true, false));
+    static void TrackModifier(uint vk, bool down) {
+        switch (vk) {
+            case 0xA0: lShift = down; break;
+            case 0xA1: rShift = down; break;
+            case 0xA2: lCtrl = down; break;
+            case 0xA3: rCtrl = down; break;
+            case 0xA4: lAlt = down; break;
+            case 0xA5: rAlt = down; break;   // AltGr
+            case 0x5B: lWin = down; break;
+            case 0x5C: rWin = down; break;
         }
-        heldMods = want;
     }
 
-    static void Unicode(List<ushort> units) {
-        List<INPUT> l = new List<INPUT>();
-        if (heldMods != 0) SetMods(l, 0);
-        foreach (ushort u in units) l.Add(KI(0, u, UNI));
-        foreach (ushort u in units) l.Add(KI(0, u, UNI | KEYUP));
-        Inject(l);
-    }
+    // zawsze jako klawisz (VK), nigdy jako znak
+    static readonly HashSet<uint> special = new HashSet<uint> {
+        0x08, 0x09, 0x0D, 0x1B, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E,
+        0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x7B, 0x0C,
+    };
 
-    static void Key(int vk, bool down, int mods, bool ext) {
-        List<INPUT> l = new List<INPUT>();
-        int id = vk | (ext ? 0x10000 : 0);
-        if (down) {
-            SetMods(l, mods);
-            l.Add(VkInput(vk, true, ext));
-            downVk.Add(id);
-        } else {
-            l.Add(VkInput(vk, false, ext));
-            downVk.Remove(id);
-            if (downVk.Count == 0) SetMods(l, 0);
+    static IntPtr KeyHook(int nCode, IntPtr wParam, IntPtr lParam) {
+        if (nCode < 0) return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+        KBDLLHOOKSTRUCT k = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(KBDLLHOOKSTRUCT));
+        if ((k.flags & LLKHF_INJECTED) != 0) return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+        bool up = (k.flags & LLKHF_UP) != 0;
+        uint vk = k.vkCode;
+        // AltGr wysyła przed sobą sztuczny lewy Ctrl (skan 0x21D): to część AltGr, nie Ctrl
+        bool fakeCtrl = vk == 0xA2 && (k.scanCode & 0x200) != 0;
+        if (!fakeCtrl) TrackModifier(vk, !up);
+
+        if (up) {
+            string msg;
+            if (upMsgs.TryGetValue(vk, out msg)) {
+                upMsgs.Remove(vk);
+                if (msg.Length > 0) Send(msg);
+                return (IntPtr)1;
+            }
+            return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
         }
-        Inject(l);
+
+        if (!onMac || !connected) return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+        // Caps Lock zostaje na Windowsie: jego stan i dioda decydują o wielkich literach
+        if (vk == 0x14) return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+        if (fakeCtrl || IsModifier(vk)) {
+            // modyfikatory idą razem z klawiszem (bity mods), osobno nie
+            upMsgs[vk] = "";
+            return (IntPtr)1;
+        }
+        try { Forward(vk, k.scanCode, (k.flags & LLKHF_EXTENDED) != 0); }
+        catch (Exception e) { Log("blad klawisza " + vk + ": " + e.Message); }
+        return (IntPtr)1;
     }
 
-    static void ReleaseAll() {
-        List<INPUT> l = new List<INPUT>();
-        foreach (int id in downVk) l.Add(VkInput(id & 0xFFFF, false, (id & 0x10000) != 0));
-        downVk.Clear();
-        SetMods(l, 0);
-        Inject(l);
+    static void Forward(uint vk, uint scan, bool ext) {
+        bool shift = lShift || rShift, ctrl = lCtrl || rCtrl, win = lWin || rWin;
+        int mods = (shift ? 1 : 0) | (ctrl ? 2 : 0) | (lAlt ? 4 : 0) | (win ? 8 : 0);
+        // skrót (Ctrl, lewy Alt, Win) albo klawisz specjalny: jako VK. AltGr to polskie litery: jako znak
+        if (!ctrl && !lAlt && !win && !special.Contains(vk)) {
+            string text = Translate(vk, scan);
+            if (text == null) { upMsgs[vk] = ""; return; } // klawisz martwy: czekamy na literę
+            if (text.Length > 0 && Printable(text)) {
+                StringBuilder hex = new StringBuilder("U");
+                foreach (char ch in text) hex.Append(' ').Append(((int)ch).ToString("X4"));
+                Send(hex.ToString());
+                upMsgs[vk] = "";
+                return;
+            }
+        }
+        if (rAlt && !ctrl) mods |= 4; // AltGr bez znaku działa jak Option
+        string e = ext ? "1" : "0";
+        Send("K " + vk + " 1 " + mods + " " + e);
+        upMsgs[vk] = "K " + vk + " 0 " + mods + " " + e;
     }
+
+    static bool Printable(string s) {
+        foreach (char ch in s) if (ch < 0x20 || ch == 0x7F) return false;
+        return true;
+    }
+
+    /// Znak z układu aktywnego okna (np. polski programisty). null = klawisz martwy.
+    static string Translate(uint vk, uint scan) {
+        byte[] state = new byte[256];
+        if (lShift || rShift) { state[0x10] = 0x80; state[lShift ? 0xA0 : 0xA1] = 0x80; }
+        if (rAlt) { state[0x11] = 0x80; state[0x12] = 0x80; state[0xA2] = 0x80; state[0xA5] = 0x80; }
+        if ((GetKeyState(0x14) & 1) != 0) state[0x14] = 0x01;
+        IntPtr hkl = GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), IntPtr.Zero));
+        StringBuilder buf = new StringBuilder(8);
+        // flaga 4: nie ruszaj stanu klawiszy martwych w samym Windowsie (Windows 10 1607+)
+        int r = ToUnicodeEx(vk, scan, state, buf, buf.Capacity, 4, hkl);
+        if (r < 0) {
+            deadChar = buf.Length > 0 ? buf[0] : '\0';
+            return null;
+        }
+        string s = r > 0 ? buf.ToString(0, Math.Min(r, buf.Length)) : "";
+        if (deadChar != '\0') {
+            s = Compose(deadChar, s);
+            deadChar = '\0';
+        }
+        return s;
+    }
+
+    // akcent z klawisza martwego -> znak łączący Unicode
+    static readonly Dictionary<char, char> combining = new Dictionary<char, char> {
+        { '´', '́' }, { '\'', '́' }, { '`', '̀' }, { '^', '̂' }, { 'ˆ', '̂' },
+        { '¨', '̈' }, { '"', '̈' }, { '~', '̃' }, { '˜', '̃' }, { 'ˇ', '̌' },
+        { '˛', '̨' }, { '˙', '̇' }, { '¸', '̧' }, { '˝', '̋' },
+        { '°', '̊' }, { '˚', '̊' }, { '˘', '̆' },
+    };
+
+    static string Compose(char dead, string s) {
+        if (s.Length == 0 || s == " ") return dead.ToString();
+        char comb;
+        if (s.Length == 1 && combining.TryGetValue(dead, out comb)) {
+            string c = (s + comb).Normalize(NormalizationForm.FormC);
+            if (c.Length == 1) return c;
+        }
+        return dead + s;
+    }
+
+    // ---------- mysz ----------
 
     static void HookThread() {
-        hookRef = new HookProc(MouseHook);
-        IntPtr h = SetWindowsHookEx(14, hookRef, GetModuleHandle(null), 0);
-        if (h == IntPtr.Zero) { Log("SetWindowsHookEx blad " + Marshal.GetLastWin32Error()); return; }
+        keyRef = new HookProc(KeyHook);
+        mouseRef = new HookProc(MouseHook);
+        IntPtr mod = GetModuleHandle(null);
+        if (SetWindowsHookEx(13, keyRef, mod, 0) == IntPtr.Zero) Log("hook klawiatury blad " + Marshal.GetLastWin32Error());
+        if (SetWindowsHookEx(14, mouseRef, mod, 0) == IntPtr.Zero) Log("hook myszy blad " + Marshal.GetLastWin32Error());
         MSG m;
         while (GetMessage(out m, IntPtr.Zero, 0, 0) > 0) { }
     }
 
     static IntPtr MouseHook(int nCode, IntPtr wParam, IntPtr lParam) {
-        if (nCode >= 0) {
+        if (nCode >= 0 && onMac) {
             MSLLHOOKSTRUCT s = (MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(MSLLHOOKSTRUCT));
             if ((s.flags & 1) == 0) { // tylko fizyczna mysz, nie wstrzyknieta
                 int msg = wParam.ToInt32();
@@ -240,12 +321,12 @@ public static class Agent {
         long lastPing = 0;
         while (true) {
             Thread.Sleep(25);
-            long now = Ms();
             if (mouseFlag) {
                 mouseFlag = false;
-                if (now - lastSignalMs > 150) { lastSignalMs = now; Send("M"); }
+                ToWindows(); // ruch myszy Windowsa: klawiatura wraca tutaj
             }
-            if (now - lastPing > 2000) { lastPing = now; Send("P"); }
+            long now = Ms();
+            if (now - lastPing > 2000) { lastPing = now; if (connected) Send("P"); }
         }
     }
 }
