@@ -1,34 +1,34 @@
-# Jedna Klawiatura
+# One Keyboard
 
-Klawiatura Maca pisze na Windowsie, kiedy ruszasz myszą Windowsa. Ruszysz gładzikiem Maca i klawiatura wraca na Maca. Każdy komputer zostaje przy swoim kursorze.
+Your Mac keyboard types on Windows as soon as you move the Windows mouse. Touch the Mac trackpad and the keyboard is back on the Mac. Each computer keeps its own cursor.
 
-## Jak działa
+## How it works
 
-- **Mac** (`mac/`): aplikacja w pasku menu (Swift). Przechwytuje klawiaturę przez event tap i wysyła ją po TCP (port 24850), gdy aktywny jest Windows. Ikona: `⌨ MAC`, `⌨ WIN`, `⌨ -` (brak Windowsa), `⌨ !` (brak uprawnienia Dostępność).
-- **Windows** (`windows/`): agent w PowerShellu z wbudowanym C#. Wpisuje znaki przez `SendInput` i zgłasza Macowi ruch fizycznej myszy (hook `WH_MOUSE_LL`).
+- **Mac** (`mac/`): a menu bar app (Swift). It captures the keyboard with an event tap and sends it over TCP (port 24850) while Windows is active. Menu bar icon: `⌨ MAC`, `⌨ WIN`, `⌨ -` (no Windows agent connected), `⌨ !` (Accessibility permission missing).
+- **Windows** (`windows/`): a PowerShell agent with embedded C#. It types characters with `SendInput` and reports physical mouse movement back to the Mac (`WH_MOUSE_LL` hook).
 
-Znaki liczone są z bieżącego układu Maca (np. Polish Pro), więc polskie litery przechodzą jako Unicode niezależnie od układu Windowsa. Skróty: Cmd → Ctrl, Cmd+←/→ → Home/End, Option+←/→ → skok o słowo.
+Characters are resolved with the Mac's current keyboard layout (e.g. Polish Pro), so accented letters arrive as Unicode regardless of the Windows layout. Shortcuts: Cmd → Ctrl, Cmd+←/→ → Home/End, Option+←/→ → jump by word.
 
-## Instalacja
+## Installation
 
 Mac:
 
 ```sh
 ./build.sh
-cp mac/pl.ghost.jednaklawiatura.plist ~/Library/LaunchAgents/   # autostart
+cp mac/pl.ghost.jednaklawiatura.plist ~/Library/LaunchAgents/   # start at login
 open /Applications/JednaKlawiatura.app
 ```
 
-Potem włącz JednaKlawiatura w Ustawienia systemowe → Prywatność i ochrona → Dostępność. Aplikacja jest podpisana ad-hoc, więc po każdej przebudowie trzeba to zrobić ponownie (`tccutil reset Accessibility pl.ghost.jednaklawiatura`).
+Then enable JednaKlawiatura in System Settings → Privacy & Security → Accessibility. The app is ad-hoc signed, so after every rebuild you have to enable it again (`tccutil reset Accessibility pl.ghost.jednaklawiatura`).
 
-Windows (PowerShell jako administrator, żeby pisać też do okien uruchomionych jako admin):
+Windows (PowerShell as administrator, so it can also type into windows running as admin):
 
 ```sh
-./serwuj-instalator.sh        # na Macu, wypisze polecenie
+./serwuj-instalator.sh        # on the Mac, prints the command to run
 ```
 
 ```powershell
-irm http://IP_MACA:24851/instaluj.ps1 | iex
+irm http://MAC_IP:24851/instaluj.ps1 | iex
 ```
 
-Agent startuje sam po zalogowaniu (zadanie harmonogramu `JednaKlawiatura`). Log: `%LOCALAPPDATA%\JednaKlawiatura\agent.log`. Adresy Maca, których szuka agent, są w parametrze `$Hosts` w `windows/agent.ps1`.
+The agent starts by itself after login (scheduled task `JednaKlawiatura`). Log: `%LOCALAPPDATA%\JednaKlawiatura\agent.log`. The Mac addresses the agent looks for are in the `$Hosts` parameter in `windows/agent.ps1`.
