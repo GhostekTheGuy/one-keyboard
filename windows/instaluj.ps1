@@ -5,6 +5,8 @@ $ErrorActionPreference = 'Stop'
 $base = '__BASE__'
 $dir = Join-Path $env:LOCALAPPDATA 'JednaKlawiatura'
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
+# adresy Maca podstawia serwuj-instalator.sh (sieć domowa, nazwa .local, Tailscale)
+'__HOSTS__' -split ',' | Where-Object { $_ } | Set-Content -Encoding ASCII (Join-Path $dir 'hosts.txt')
 $agent = Join-Path $dir 'agent.ps1'
 Invoke-WebRequest -UseBasicParsing "$base/agent.ps1" -OutFile $agent
 
