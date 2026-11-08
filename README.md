@@ -35,6 +35,6 @@ Windows (PowerShell as administrator, so keys also reach the Mac while an admin 
 irm http://MAC_IP:24851/instaluj.ps1 | iex
 ```
 
-The agent starts by itself after login (scheduled task `JednaKlawiatura`). Log: `%LOCALAPPDATA%\JednaKlawiatura\agent.log`. The Mac addresses the agent looks for are in the `$Hosts` parameter in `windows/agent.ps1`.
+The agent starts by itself after login (scheduled task `JednaKlawiatura`). Log: `%LOCALAPPDATA%\JednaKlawiatura\agent.log`. The installer saves the Mac addresses the agent looks for (home network IP, `.local` name and Tailscale IP if available) to `%LOCALAPPDATA%\JednaKlawiatura\hosts.txt`, one per line; edit it if the Mac's address changes.
 
 Both editions use the same app name, task and port, so installing one replaces the other on both computers. Switch by checking out the other branch and installing again.

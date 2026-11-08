@@ -11,6 +11,16 @@ $dir = Join-Path $env:LOCALAPPDATA 'JednaKlawiatura'
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $log = Join-Path $dir 'agent.log'
 
+# Adresy Maca nie siedzą w kodzie: zapisuje je instalator do hosts.txt (jeden na linię).
+if (-not $Hosts) {
+    $hostsFile = Join-Path $dir 'hosts.txt'
+    if (Test-Path $hostsFile) { $Hosts = @(Get-Content $hostsFile | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+}
+if (-not $Hosts) {
+    Add-Content $log "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') brak adresu Maca: uruchom instalator ponownie albo wpisz adres do $dir\hosts.txt"
+    exit 1
+}
+
 $code = @'
 using System;
 using System.Collections.Concurrent;
